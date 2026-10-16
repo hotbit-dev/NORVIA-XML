@@ -2,7 +2,9 @@
 // Não armazena certificados: recebe o .pfx por requisição (via HTTPS, autenticado por token),
 // usa-o em memória e o descarta. Nunca registra certificado, senha ou corpo da requisição.
 import http from "node:http";
+import crypto from "node:crypto";
 import { Agent, request } from "undici";
+import forge from "node-forge";
 
 const PORT = Number(process.env.PORT ?? 8080);
 const TOKEN = process.env.BRIDGE_TOKEN;
@@ -17,8 +19,35 @@ const HOSTS = {
 const DFE_QUERY = process.env.ADN_DFE_QUERY ?? ""; // ex.: "lote=true"
 const CNPJ_PARAM = process.env.ADN_CNPJ_CONSULTA_PARAM ?? ""; // nome do parâmetro de CNPJ de consulta, se usado
 
+// Muitos .pfx A1 usam criptografia antiga (RC2-40 / 3DES) que o OpenSSL 3 do Node recusa com
+// ERR_CRYPTO_UNSUPPORTED_OPERATION. Extraímos chave e certificado com node-forge, que entende
+// esses formatos, e entregamos PEM ao TLS. Se algo der errado, usamos o .pfx como está.
+function tlsOptions(pfx, password) {
+  try {
+    const p12 = forge.pkcs12.pkcs12FromAsn1(forge.asn1.fromDer(pfx.toString("binary")), password);
+    let key = null;
+    const certs = [];
+    for (const safe of p12.safeContents) {
+      for (const bag of safe.safeBags) {
+        if (bag.type === forge.pki.oids.pkcs8ShroudedKeyBag || bag.type === forge.pki.oids.keyBag) key = bag.key;
+        if (bag.type === forge.pki.oids.certBag && bag.cert) certs.push(forge.pki.certificateToPem(bag.cert));
+      }
+    }
+    if (key && certs.length) {
+      const keyPem = forge.pki.privateKeyToPem(key);
+      const certPem = certs.join("");
+      crypto.createPrivateKey(keyPem);
+      new crypto.X509Certificate(certPem);
+      return { cert: certPem, key: keyPem };
+    }
+  } catch {
+    // segue usando o .pfx original
+  }
+  return { pfx, passphrase: password };
+}
+
 function agentFor({ pfx_base64, password }) {
-  return new Agent({ connect: { pfx: Buffer.from(pfx_base64, "base64"), passphrase: password, timeout: 20_000 } });
+  return new Agent({ connect: { ...tlsOptions(Buffer.from(pfx_base64, "base64"), password), timeout: 20_000 } });
 }
 
 async function readJson(req) {
