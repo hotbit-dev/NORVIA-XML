@@ -5,6 +5,7 @@ import http from "node:http";
 import crypto from "node:crypto";
 import { Agent, request } from "undici";
 import forge from "node-forge";
+import { sefazDistribution } from "./sefaz.mjs";
 
 const PORT = Number(process.env.PORT ?? 8080);
 const TOKEN = process.env.BRIDGE_TOKEN;
@@ -72,8 +73,9 @@ const server = http.createServer(async (req, res) => {
     if (!hosts) return send(res, 400, { error: "environment inválido" });
     const dispatcher = agentFor(body);
     try {
+      if (req.url === "/sefaz/dfe") return send(res, 200, await sefazDistribution(body, dispatcher));
       if (req.url === "/adn/dfe") {
-        const nsu = Math.max(0, Number(body.nsu) | 0);
+        const nsu = Math.max(0, Number(body.nsu));
         const qs = new URLSearchParams(DFE_QUERY);
         if (CNPJ_PARAM && body.cnpj_consulta) qs.set(CNPJ_PARAM, String(body.cnpj_consulta));
         const url = `${hosts.adn}/DFe/${nsu}${qs.toString() ? "?" + qs : ""}`;
