@@ -6,6 +6,7 @@ import crypto from "node:crypto";
 import { Agent, request } from "undici";
 import forge from "node-forge";
 import { sefazDistribution } from "./sefaz.mjs";
+import { adnManifest, sefazEvent } from "./manifest.mjs";
 
 const PORT = Number(process.env.PORT ?? 8080);
 const TOKEN = process.env.BRIDGE_TOKEN;
@@ -74,6 +75,8 @@ const server = http.createServer(async (req, res) => {
     const dispatcher = agentFor(body);
     try {
       if (req.url === "/sefaz/dfe") return send(res, 200, await sefazDistribution(body, dispatcher));
+      if (req.url === "/sefaz/evento") return send(res, 200, await sefazEvent(body, dispatcher, Buffer.from(body.pfx_base64, "base64"), body.password));
+      if (req.url === "/adn/manifest") return send(res, 200, await adnManifest(body, dispatcher, hosts, Buffer.from(body.pfx_base64, "base64"), body.password));
       if (req.url === "/adn/dfe") {
         const nsu = Math.max(0, Number(body.nsu));
         const qs = new URLSearchParams(DFE_QUERY);
