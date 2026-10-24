@@ -1,5 +1,6 @@
 // Envio de eventos de manifestação do destinatário: NF-e/CT-e via SOAP SEFAZ, NFS-e via ADN.
 // Os eventos são assinados (XMLDSig RSA-SHA1) com a chave extraída do .pfx via node-forge.
+import zlib from "node:zlib";
 import { request } from "undici";
 import { XMLParser } from "fast-xml-parser";
 import forge from "node-forge";
@@ -28,8 +29,7 @@ function extractKeyCert(pfxBuffer, password) {
 
 const sha1B64 = (str) => { const md = forge.md.sha1.create(); md.update(str, "utf8"); return forge.util.encode64(md.digest().bytes()); };
 
-// Assinatura enveloped do infEvento. Como o XML é gerado aqui sem espaços entre tags,
-// a forma já é a canônica (C14N), então o digest/signature incidem sobre a string literal.
+// Assinatura enveloped do infEvento.
 function signInfEvento(key, certDerB64, infXml, id) {
   const digest = sha1B64(infXml);
   const signedInfo = `<SignedInfo xmlns="http://www.w3.org/2000/09/xmldsig#"><CanonicalizationMethod Algorithm="http://www.w3.org/TR/2001/REC-xml-c14n-20010315"/><SignatureMethod Algorithm="http://www.w3.org/2000/09/xmldsig#rsa-sha1"/><Reference URI="#${id}"><Transforms><Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/><Transform Algorithm="http://www.w3.org/TR/2001/REC-xml-c14n-20010315"/></Transforms><DigestMethod Algorithm="http://www.w3.org/2000/09/xmldsig#sha1"/><DigestValue>${digest}</DigestValue></Reference></SignedInfo>`;
@@ -98,21 +98,44 @@ export async function sefazEvent(body, dispatcher, pfxBuffer, password) {
   return { ok, code: r.event_code || r.code, message: r.event_message || r.message, protocol: r.protocol };
 }
 
-// Manifestação de NFS-e no ADN. O caminho do endpoint é configurado por env após conferência
-// no Swagger oficial (/contribuintes/docs) — nunca assumimos uma rota não documentada.
+// Manifestação de NFS-e: eventos recebidos pelo SEFIN Nacional em POST /nfse/{chave}/eventos
+const SEFIN = {
+  homologacao: "https://sefin.producaorestrita.nfse.gov.br/SefinNacional",
+  producao: "https://sefin.nfse.gov.br/SefinNacional",
+};
+
+function describeError(json, text, status, url) {
+  const e = Array.isArray(json?.erro) ? json.erro[0] : Array.isArray(json?.erros) ? json.erros[0] : Array.isArray(json?.Erros) ? json.Erros[0] : null;
+  const detail = e ? [e.Codigo ?? e.codigo, e.Descricao ?? e.descricao, e.Complemento ?? e.complemento].filter(Boolean).join(" — ") : (json?.mensagem ?? json?.message ?? json?.title ?? String(text ?? "").trim().slice(0, 300));
+  return `Portal Nacional respondeu HTTP ${status}${detail ? `: ${detail}` : " sem detalhes"} (${url.replace(/\/nfse\/[^/]+\//, "/nfse/{chave}/")})`;
+}
+
 export async function adnManifest(body, dispatcher, hosts, pfxBuffer, password) {
-  const path = process.env.ADN_MANIFEST_PATH ?? "";
-  if (!path) throw new Error("Manifestação de NFS-e não configurada no serviço de integração (defina ADN_MANIFEST_PATH conforme o Swagger do ADN).");
-  if (!/^\d{14}$/.test(String(body.cnpj ?? "")) || !String(body.chave ?? "").replace(/\D/g, "").length) throw new Error("CNPJ ou chave inválidos para o evento.");
+  const chave = String(body.chave ?? "").replace(/\D/g, "");
+  if (!/^\d{14}$/.test(String(body.cnpj ?? "")) || !chave) throw new Error("CNPJ ou chave inválidos para o evento.");
+  const env = body.environment === "producao" ? "producao" : "homologacao";
   const { key, certDerB64 } = extractKeyCert(pfxBuffer, password);
-  const id = `ID${body.code}${String(body.chave).replace(/\D/g, "")}01`;
-  const inf = `<infEvento Id="${id}"><tpAmb>${body.environment === "producao" ? 1 : 2}</tpAmb><CNPJ>${body.cnpj}</CNPJ><chNFSe>${body.chave}</chNFSe><dhEvento>${dhEvento()}</dhEvento><tpEvento>${body.code}</tpEvento><nSeqEvento>1</nSeqEvento><verEvento>1.00</verEvento><detEvento versao="1.00"><descEvento>${escapeXml(body.descricao ?? "Manifestacao do Tomador")}</descEvento></detEvento></infEvento>`;
-  const signed = `<evento versao="1.00" xmlns="http://www.sped.fazenda.gov.br/nfse">${inf}${signInfEvento(key, certDerB64, inf, id)}</evento>`;
-  const url = `${hosts.adn}${path.replace("{chave}", encodeURIComponent(String(body.chave)))}`;
-  const r = await request(url, { method: "POST", dispatcher, headersTimeout: 30000, bodyTimeout: 30000, headers: { "content-type": "application/xml", accept: "application/json" }, body: signed });
+  // Leiaute SEFIN Nacional (Anexo II): Id = "PRE" + chave(50) + tpEvento(6) = 59 caracteres exatos (sem nPedRegEvento).
+  const DESC = { "203202": "Manifestação de NFS-e - Confirmação do Tomador", "203206": "Manifestação de NFS-e - Rejeição do Tomador" };
+  const code = String(body.code ?? "");
+  if (!DESC[code]) throw new Error(`Evento de NFS-e não suportado: ${code}.`);
+  if (chave.length !== 50) throw new Error("Chave de acesso da NFS-e deve ter 50 dígitos.");
+  const id = `PRE${chave}${code}`;
+  const motivo = code === "203206" ? `<cMotivo>9</cMotivo><xMotivo>${escapeXml(body.justificativa ?? "")}</xMotivo>` : "";
+  const inf = `<infPedReg Id="${id}"><tpAmb>${env === "producao" ? 1 : 2}</tpAmb><verAplic>PainelFiscal-1.0</verAplic><dhEvento>${dhEvento()}</dhEvento><CNPJAutor>${body.cnpj}</CNPJAutor><chNFSe>${chave}</chNFSe><e${code}><xDesc>${DESC[code]}</xDesc>${motivo}</e${code}></infPedReg>`;
+  const signed = `<?xml version="1.0" encoding="UTF-8"?><pedRegEvento versao="1.00" xmlns="http://www.sped.fazenda.gov.br/nfse">${inf}${signInfEvento(key, certDerB64, inf, id)}</pedRegEvento>`;
+  const gz = zlib.gzipSync(Buffer.from(signed, "utf8")).toString("base64");
+  const custom = process.env.ADN_MANIFEST_URL ?? "";
+  const url = custom ? custom.replace("{chave}", chave) : `${SEFIN[env]}/nfse/${chave}/eventos`;
+  let r;
+  try {
+    r = await request(url, { method: "POST", dispatcher, headersTimeout: 30000, bodyTimeout: 30000, headers: { "content-type": "application/json", accept: "application/json" }, body: JSON.stringify({ pedidoRegistroEventoXmlGZipB64: gz }) });
+  } catch (e) {
+    return { ok: false, code: "conexao", message: `Sem resposta do Portal Nacional (${e?.code ?? e?.message ?? "erro de rede"}).`, protocol: null };
+  }
   const text = await r.body.text();
   let json = null;
-  try { json = JSON.parse(text); } catch { json = { raw: text.slice(0, 500) }; }
+  try { json = JSON.parse(text); } catch { json = null; }
   const ok = r.statusCode >= 200 && r.statusCode < 300;
-  return { ok, code: String(r.statusCode), message: ok ? "Evento registrado no ADN." : String(json?.Erros?.[0]?.Descricao ?? json?.raw ?? `ADN respondeu HTTP ${r.statusCode}`), protocol: json?.Protocolo ?? json?.protocolo ?? null };
+  return { ok, code: String(r.statusCode), message: ok ? "Evento registrado no Portal Nacional." : describeError(json, text, r.statusCode, url), protocol: json?.protocolo ?? json?.Protocolo ?? json?.idEvento ?? null };
 }
