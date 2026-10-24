@@ -1,5 +1,5 @@
-// Envio de eventos de manifestação do destinatário: NF-e/CT-e via SOAP SEFAZ, NFS-e via ADN.
-// Os eventos são assinados (XMLDSig RSA-SHA1) com a chave extraída do .pfx via node-forge.
+// Envio de eventos de manifestação do destinatário: NF-e/CT-e via SOAP SEFAZ, NFS-e via ADN/SEFIN.
+// SEFAZ usa XMLDSig RSA-SHA1 (c14n); NFS-e Nacional usa XMLDSig RSA-SHA256 (exc-c14n).
 import zlib from "node:zlib";
 import { request } from "undici";
 import { XMLParser } from "fast-xml-parser";
@@ -27,15 +27,34 @@ function extractKeyCert(pfxBuffer, password) {
   return { key, certDerB64: forge.util.encode64(forge.asn1.toDer(forge.pki.certificateToAsn1(cert)).getBytes()) };
 }
 
-const sha1B64 = (str) => { const md = forge.md.sha1.create(); md.update(str, "utf8"); return forge.util.encode64(md.digest().bytes()); };
-
-// Assinatura enveloped do infEvento.
-function signInfEvento(key, certDerB64, infXml, id) {
-  const digest = sha1B64(infXml);
+// Assinatura SEFAZ (NF-e e CT-e): RSA-SHA1 com C14N inclusivo
+function signSefazEvento(key, certDerB64, infXml, id) {
+  const mdSha1 = forge.md.sha1.create();
+  mdSha1.update(infXml, "utf8");
+  const digest = forge.util.encode64(mdSha1.digest().bytes());
   const signedInfo = `<SignedInfo xmlns="http://www.w3.org/2000/09/xmldsig#"><CanonicalizationMethod Algorithm="http://www.w3.org/TR/2001/REC-xml-c14n-20010315"/><SignatureMethod Algorithm="http://www.w3.org/2000/09/xmldsig#rsa-sha1"/><Reference URI="#${id}"><Transforms><Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/><Transform Algorithm="http://www.w3.org/TR/2001/REC-xml-c14n-20010315"/></Transforms><DigestMethod Algorithm="http://www.w3.org/2000/09/xmldsig#sha1"/><DigestValue>${digest}</DigestValue></Reference></SignedInfo>`;
-  const md = forge.md.sha1.create();
-  md.update(signedInfo, "utf8");
-  const sig = forge.util.encode64(key.sign(md));
+  const mdSign = forge.md.sha1.create();
+  mdSign.update(signedInfo, "utf8");
+  const sig = forge.util.encode64(key.sign(mdSign));
+  return `<Signature xmlns="http://www.w3.org/2000/09/xmldsig#">${signedInfo}<SignatureValue>${sig}</SignatureValue><KeyInfo><X509Data><X509Certificate>${certDerB64}</X509Certificate></X509Data></KeyInfo></Signature>`;
+}
+
+// Assinatura NFS-e Nacional (SEFIN): RSA-SHA256 com Exclusive C14N (exc-c14n)
+function signNfseEvento(key, certDerB64, infInner, id) {
+  // 1. Digest SHA-256 do <infPedReg> com o namespace herdado (exigência do exc-c14n)
+  const c14nInfXml = `<infPedReg xmlns="http://www.sped.fazenda.gov.br/nfse" Id="${id}">${infInner}</infPedReg>`;
+  const mdDigest = forge.md.sha256.create();
+  mdDigest.update(c14nInfXml, "utf8");
+  const digest = forge.util.encode64(mdDigest.digest().bytes());
+
+  // 2. SignedInfo canônico conforme W3C exc-c14n (tags vazias expandidas)
+  const signedInfo = `<SignedInfo xmlns="http://www.w3.org/2000/09/xmldsig#"><CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"></CanonicalizationMethod><SignatureMethod Algorithm="http://www.w3.org/2001/04/xmldsig-more#rsa-sha256"></SignatureMethod><Reference URI="#${id}"><Transforms><Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"></Transform><Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"></Transform></Transforms><DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"></DigestMethod><DigestValue>${digest}</DigestValue></Reference></SignedInfo>`;
+
+  // 3. Assinatura RSA-SHA256 do SignedInfo
+  const mdSign = forge.md.sha256.create();
+  mdSign.update(signedInfo, "utf8");
+  const sig = forge.util.encode64(key.sign(mdSign));
+
   return `<Signature xmlns="http://www.w3.org/2000/09/xmldsig#">${signedInfo}<SignatureValue>${sig}</SignatureValue><KeyInfo><X509Data><X509Certificate>${certDerB64}</X509Certificate></X509Data></KeyInfo></Signature>`;
 }
 
@@ -88,7 +107,7 @@ export async function sefazEvent(body, dispatcher, pfxBuffer, password) {
   if (!/^\d{14}$/.test(String(body.cnpj ?? "")) || !/^\d{44}$/.test(String(body.chave ?? ""))) throw new Error("CNPJ ou chave inválidos para o evento.");
   const { key, certDerB64 } = extractKeyCert(pfxBuffer, password);
   const { id, inf, wrap } = buildEvento(body.source, body);
-  const signed = wrap(signInfEvento(key, certDerB64, inf, id));
+  const signed = wrap(signSefazEvento(key, certDerB64, inf, id));
   const envelope = `<?xml version="1.0" encoding="utf-8"?><soap12:Envelope xmlns:soap12="http://www.w3.org/2003/05/soap-envelope"><soap12:Body><${service.op} xmlns="${service.ns}"><${service.dados}>${signed}</${service.dados}></${service.op}></soap12:Body></soap12:Envelope>`;
   const response = await request(service[body.environment], { method: "POST", dispatcher, headersTimeout: 30000, bodyTimeout: 30000, headers: { "content-type": `application/soap+xml; charset=utf-8; action="${service.ns}/${service.op}"`, accept: "application/soap+xml" }, body: envelope });
   const raw = await response.body.text();
@@ -115,15 +134,21 @@ export async function adnManifest(body, dispatcher, hosts, pfxBuffer, password) 
   if (!/^\d{14}$/.test(String(body.cnpj ?? "")) || !chave) throw new Error("CNPJ ou chave inválidos para o evento.");
   const env = body.environment === "producao" ? "producao" : "homologacao";
   const { key, certDerB64 } = extractKeyCert(pfxBuffer, password);
-  // Leiaute SEFIN Nacional (Anexo II): Id = "PRE" + chave(50) + tpEvento(6) = 59 caracteres exatos (sem nPedRegEvento).
+
+  // Leiaute SEFIN Nacional (Anexo II): Id = "PRE" + chave(50) + tpEvento(6) = 59 caracteres exatos
   const DESC = { "203202": "Manifestação de NFS-e - Confirmação do Tomador", "203206": "Manifestação de NFS-e - Rejeição do Tomador" };
   const code = String(body.code ?? "");
   if (!DESC[code]) throw new Error(`Evento de NFS-e não suportado: ${code}.`);
   if (chave.length !== 50) throw new Error("Chave de acesso da NFS-e deve ter 50 dígitos.");
+
   const id = `PRE${chave}${code}`;
   const motivo = code === "203206" ? `<cMotivo>9</cMotivo><xMotivo>${escapeXml(body.justificativa ?? "")}</xMotivo>` : "";
-  const inf = `<infPedReg Id="${id}"><tpAmb>${env === "producao" ? 1 : 2}</tpAmb><verAplic>PainelFiscal-1.0</verAplic><dhEvento>${dhEvento()}</dhEvento><CNPJAutor>${body.cnpj}</CNPJAutor><chNFSe>${chave}</chNFSe><e${code}><xDesc>${DESC[code]}</xDesc>${motivo}</e${code}></infPedReg>`;
-  const signed = `<?xml version="1.0" encoding="UTF-8"?><pedRegEvento versao="1.00" xmlns="http://www.sped.fazenda.gov.br/nfse">${inf}${signInfEvento(key, certDerB64, inf, id)}</pedRegEvento>`;
+  const infInner = `<tpAmb>${env === "producao" ? 1 : 2}</tpAmb><verAplic>PainelFiscal-1.0</verAplic><dhEvento>${dhEvento()}</dhEvento><CNPJAutor>${body.cnpj}</CNPJAutor><chNFSe>${chave}</chNFSe><e${code}><xDesc>${DESC[code]}</xDesc>${motivo}</e${code}>`;
+
+  // Assinatura digital conforme RTC v1.01 (RSA-SHA256 + exc-c14n)
+  const signature = signNfseEvento(key, certDerB64, infInner, id);
+  const signed = `<?xml version="1.0" encoding="UTF-8"?><pedRegEvento versao="1.00" xmlns="http://www.sped.fazenda.gov.br/nfse"><infPedReg Id="${id}">${infInner}</infPedReg>${signature}</pedRegEvento>`;
+
   const gz = zlib.gzipSync(Buffer.from(signed, "utf8")).toString("base64");
   const custom = process.env.ADN_MANIFEST_URL ?? "";
   const url = custom ? custom.replace("{chave}", chave) : `${SEFIN[env]}/nfse/${chave}/eventos`;
