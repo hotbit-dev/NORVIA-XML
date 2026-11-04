@@ -80,7 +80,8 @@ const server = http.createServer(async (req, res) => {
       if (req.url === "/adn/dfe") {
         const nsu = Math.max(0, Number(body.nsu));
         const qs = new URLSearchParams(DFE_QUERY);
-        if (CNPJ_PARAM && body.cnpj_consulta) qs.set(CNPJ_PARAM, String(body.cnpj_consulta));
+        // Desde 31/10/2026 o ADN rejeita (HTTP 400) consultas sem cnpjConsulta explícito.
+        if (body.cnpj_consulta) qs.set(CNPJ_PARAM || "cnpjConsulta", String(body.cnpj_consulta).replace(/\D/g, ""));
         const url = `${hosts.adn}/DFe/${nsu}${qs.toString() ? "?" + qs : ""}`;
         const r = await request(url, { method: "GET", dispatcher, headers: { accept: "application/json" } });
         const text = await r.body.text();
